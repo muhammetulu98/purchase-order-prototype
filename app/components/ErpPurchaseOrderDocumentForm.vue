@@ -9,17 +9,18 @@
 // dönüşümüne çevrilir (D19): satır ızgaradan çıkarıldığında sunucu miktarı sıfırlayıp
 // neden 900 ile kapatır.
 import { useDebounceFn } from "@vueuse/core";
-import { History, Plus, Search, Trash2, X } from "lucide-vue-next";
+import { History, Lock, Plus, Search, Trash2, X } from "lucide-vue-next";
 import type {
   ErpPurchaseOrder,
   ErpPurchaseInvoiceHistoryItem,
+  ErpStockOrders,
   ErpStockSalesHistory,
   ErpPurchaseOrderLine,
   ErpPurchaseOrderSavePayload,
 } from "~/composables/useErpPurchaseOrders";
 import type { ErpSalesOrderLookups } from "~/composables/useErpSalesOrders";
 import { discountPercentsOf } from "~/composables/useErpSalesOrders";
-import { addDays, localIsoDate } from "~/utils/dates";
+import { addDays, formatDate, localIsoDate } from "~/utils/dates";
 import { applyDiscountChain, formatMoney, formatQuantity, parseDecimal, reverseDiscountPercent, summarize } from "~/utils/money";
 import { priceForUnit, unitFactor } from "~/utils/orderUnits";
 import type { ErpCustomerAddress } from "~/composables/useErpCustomers";
@@ -29,6 +30,8 @@ const props = defineProps<{
   detail?: { header: ErpPurchaseOrder | null; lines: ErpPurchaseOrderLine[] } | null;
   lookups: ErpSalesOrderLookups | null;
   saving?: boolean;
+  /** true: detay başka siparişten kopyalanmıştır; form düzenleme değil YENİ sipariş modundadır. */
+  copy?: boolean;
 }>();
 
 const emit = defineEmits<{ submit: [payload: ErpPurchaseOrderSavePayload] }>();
@@ -37,6 +40,9 @@ const NONE = "__none__";
 
 interface EditorLine {
   id: string | null;
+  /** Teslim alınan miktar (temel birim değil, satırın birimi) ve satırın açık olup olmadığı — düzenlemede kilit kuralı. */
+  deliveredQuantity: number;
+  open: boolean;
   productCode: string;
   productName: string;
   unitPntr: number;
@@ -65,7 +71,71 @@ const customersApi = useErpCustomers();
 const productsApi = useErpProducts();
 const purchaseApi = useErpPurchaseOrders();
 
-const isEdit = computed(() => Boolean(props.detail?.header));
+// ── Para birimi / kur (Mikro: sip_doviz_cinsi, sip_doviz_kuru) ───────────────────────────────
+// Başlıkta tek para birimi ve tek kur (1 birim = ? TL). Satırdaki birim fiyat bu para biriminde girilir; satın alma şartları TL'dir,
+// bu yüzden şart üst sınırı kurla çevrilip karşılaştırılır. Para birimi değişince mevcut fiyatlar TL değeri korunarak çevrilir.
+const CURRENCIES = [{ code: "TRY", symbol: "₺", name: "TL" }, { code: "USD", symbol: "$", name: "USD (Dolar)" }, { code: "EUR", symbol: "€", name: "EUR (Euro)" }] as const;
+const currencyCode = ref<string>("TRY");
+const exchangeRate = ref(1);
+const todayRates = ref<Record<string, number>>({});
+const currencySymbol = computed(() => CURRENCIES.find((c) => c.code === currencyCode.value)?.symbol ?? currencyCode.value);
+const isForeign = computed(() => currencyCode.value !== "TRY");
+const rateOf = (code: string) => (code === "TRY" ? 1 : todayRates.value[code] ?? 0);
+const round4 = (v: number) => Math.round(v * 10000) / 10000;
+const ratesReady = purchaseApi.exchangeRates().then((r) => { todayRates.value = r; }).catch(() => undefined);
+const setCurrency = (code: string) => {
+  const oldRate = exchangeRate.value || 1;
+  const newRate = rateOf(code) || 1;
+  currencyCode.value = code;
+  exchangeRate.value = newRate;
+  for (const l of lines.value.filter((x) => !isLocked(x))) l.unitPrice = round4((l.unitPrice * oldRate) / newRate);
+};
+// TL tutarı seçili para birimine çevirir (satın alma şartı fiyatı TL'dir).
+const fromTl = (tl: number) => round4(tl / (exchangeRate.value || 1));
+const fm = (v: number) => `${formatMoney(v)} ${currencySymbol.value}`;
+// Birim fiyat / üst sınır 4 ondalığa kadar gösterilir (dövizde küçük fiyatlar 2 ondalıkta yanıltır).
+const fp = (v: number) => `${new Intl.NumberFormat("tr-TR", { minimumFractionDigits: 2, maximumFractionDigits: 4 }).format(v)} ${currencySymbol.value}`;
+
+const isEdit = computed(() => Boolean(props.detail?.header) && !props.copy);
+
+// ── Düzenleme kuralları (Mikro Fly mantığı) ──────────────────────────────────────────
+// • Kayıtlı satır SİLİNEMEZ (yalnız kapatılır); ekranda eklenip henüz kaydedilmemiş satır silinebilir.
+// • Teslim alınmış (teslim miktarı > 0) ya da kapalı satıra MÜDAHALE EDİLEMEZ: miktar, fiyat, iskonto, depo, tarih kilitlidir.
+//   Böyle satırın açık kalanı yalnız KAPATILARAK sonlandırılır.
+// • Kapatma anında uygulanır (kaydet gerekmez), neden seçilir; teslim alınmış satır da kapatılabilir.
+const isPersisted = (l: EditorLine) => isEdit.value && l.id !== null;
+const isLocked = (l: EditorLine) => isPersisted(l) && (l.deliveredQuantity > 0 || !l.open);
+const lockReason = (l: EditorLine) => (!l.open ? "Kapalı satır" : `Teslim alınan: ${formatQuantity(l.deliveredQuantity)}`);
+const editableLines = computed(() => lines.value.filter((l) => !isLocked(l)));
+const closeReasonList = ref<{ code: string; name: string | null }[]>([]);
+const closeDialogOpen = ref(false);
+const closeTargets = ref<EditorLine[]>([]);
+const closeReason = ref("");
+const closeBusy = ref(false);
+const closeNote = ref("");
+const openClose = async (targets: EditorLine[]) => {
+  targets = targets.filter((l) => isPersisted(l) && l.open);
+  if (!targets.length) { closeNote.value = "Kapatılacak açık satır yok."; return; }
+  closeNote.value = "";
+  closeTargets.value = targets;
+  closeReason.value = "";
+  closeDialogOpen.value = true;
+  if (!closeReasonList.value.length) closeReasonList.value = await purchaseApi.closeReasons().catch(() => []);
+};
+const confirmClose = async () => {
+  closeBusy.value = true;
+  try {
+    await purchaseApi.closeLines(closeTargets.value.map((l) => l.id!), closeReason.value);
+    for (const l of closeTargets.value) l.open = false;
+    closeNote.value = `${closeTargets.value.length} satır kapatıldı.`;
+    closeDialogOpen.value = false;
+  } catch (err) {
+    closeNote.value = err instanceof Error ? err.message : "Satırlar kapatılamadı.";
+    closeDialogOpen.value = false;
+  } finally {
+    closeBusy.value = false;
+  }
+};
 
 // ── Başlık ────────────────────────────────────────────────────────────────────────────
 // Seri, sıra no ve sipariş tarihi kullanıcıdan alınmaz; yeni evrakta sunucu sıra no verir. shortcut: seri sabit "A", seri kuralı gelince sunucudan alınmalı.
@@ -82,8 +152,8 @@ const activeProjects = computed(() =>
 const deliveryDate = ref(addDays(3));
 // Üstteki depo / teslim tarihi satırlara yazılır; satırda ayrıca değiştirilebilir.
 const headerDepot = ref(1);
-const setHeaderDepot = (no: number) => { headerDepot.value = no; lines.value.forEach((l) => (l.depotNo = no)); };
-const setHeaderDelivery = (v: string | number | null | undefined) => { deliveryDate.value = String(v ?? ""); lines.value.forEach((l) => (l.deliveryDate = deliveryDate.value)); };
+const setHeaderDepot = (no: number) => { headerDepot.value = no; lines.value.filter((l) => !isLocked(l)).forEach((l) => (l.depotNo = no)); };
+const setHeaderDelivery = (v: string | number | null | undefined) => { deliveryDate.value = String(v ?? ""); lines.value.filter((l) => !isLocked(l)).forEach((l) => (l.deliveryDate = deliveryDate.value)); };
 const note1 = ref("");
 
 const lines = ref<EditorLine[]>([]);
@@ -145,12 +215,49 @@ const pickerLoading = ref(false);
 const pickerItems = ref<ErpProduct[]>([]);
 const pickerSelected = ref<string[]>([]);
 const pickerAdding = ref(false);
+// Alınan / verilen sipariş miktarına tıklayınca o stoğun sipariş detayı açılır (ilk tıklamada çekilir, sonra saklanır).
+const stockOrdersCache = ref<Record<string, ErpStockOrders | "error">>({});
+const loadStockOrders = async (code: string) => {
+  if (stockOrdersCache.value[code]) return;
+  stockOrdersCache.value[code] = await purchaseApi.stockOrders(code).catch(() => "error" as const);
+};
+const orderDetailOpen = ref(false);
+const orderDetailItem = ref<ErpProduct | null>(null);
+const orderDetailTab = ref<"received" | "given">("received");
+// Depo filtresi (depo adı; ALL = hepsi): özet kutuları ve tablo seçilen depoya göre süzülür.
+const orderDetailDepot = ref("ALL");
+const openStockOrderDetail = (item: ErpProduct, kind: "received" | "given") => {
+  orderDetailItem.value = item;
+  orderDetailDepot.value = "ALL";
+  orderDetailTab.value = kind;
+  orderDetailOpen.value = true;
+  void loadStockOrders(item.code);
+};
+// Yalnız AÇIKTA BEKLEYEN siparişler: kalanı olmayan (tamamı sevk edilmiş / teslim alınmış) evrak gösterilmez; miktarlar kalan üzerindendir.
+const orderDetailRows = (kind: "received" | "given") =>
+  (stockOrdersOf(orderDetailItem.value?.code ?? "")?.[kind] ?? [])
+    .filter((r) => r.quantity - r.deliveredQuantity > 0 && (orderDetailDepot.value === "ALL" || r.depotName === orderDetailDepot.value));
+const waitingOf = (r: { quantity: number; deliveredQuantity: number }) => r.quantity - r.deliveredQuantity;
+const orderDetailTotals = (kind: "received" | "given") => {
+  const rows = orderDetailRows(kind);
+  const waiting = rows.reduce((sum, r) => sum + waitingOf(r), 0);
+  const amount = rows.reduce((sum, r) => sum + applyDiscountChain(waitingOf(r) * r.unitPrice, r.discountPercents), 0);
+  return { waiting, amount, count: rows.length };
+};
+const stockOrdersOf = (code: string) => {
+  const v = stockOrdersCache.value[code];
+  return v && v !== "error" ? v : null;
+};
+// Modaldaki depo sütunları: listedeki stokların depo dökümünden (genelde İkitelli, Plaza).
+const pickerDepots = computed(() => [...new Map(pickerItems.value.flatMap((i) => i.depotBalances ?? []).map((d) => [d.depotNo, { no: d.depotNo, name: d.depotName }])).values()]);
 
 // Yalnız seçili tedarikçinin ürünleri (varsayılan açık); tedarikçi yoksa süzme uygulanmaz.
 const onlySupplierProducts = ref(true);
 const supplierFilterOn = computed(() => onlySupplierProducts.value && Boolean(supplierCode.value));
 const clearAllLines = () => {
-  if (lines.value.length && window.confirm(`${lines.value.length} satırın tümü silinsin mi?`)) lines.value = [];
+  // Düzenlemede kayıtlı satırlar silinemez; yalnız henüz kaydedilmemiş (ekranda eklenen) satırlar temizlenir.
+  const removable = lines.value.filter((l) => !isPersisted(l)).length;
+  if (removable && window.confirm(`${removable} satırın tümü silinsin mi?`)) lines.value = lines.value.filter(isPersisted);
 };
 
 const openPicker = async () => {
@@ -186,7 +293,7 @@ const togglePicker = (code: string, checked: boolean | "indeterminate") => {
 const addPicked = async () => {
   pickerAdding.value = true;
   try {
-    for (const product of pickerItems.value.filter((item) => pickerSelected.value.includes(item.code))) await addLine(product);
+    for (const product of pickerItems.value.filter((item) => pickerSelected.value.includes(item.code))) await addWithListUnit(product);
     pickerOpen.value = false;
   } finally {
     pickerAdding.value = false;
@@ -370,9 +477,9 @@ const importPasted = async () => {
       line.quantity = quantity;
       if (price !== null) line.unitPrice = price;
       if (overMaxPrice(line)) {
-        const limit = line.maxUnitPrice!;
+        const limit = capOf(line)!;
         lines.value.pop();
-        fail(`Birim fiyat satın alma şartındaki fiyatın (${formatMoney(limit)}) üstüne çıkamaz, eklenmedi.`);
+        fail(`Birim fiyat satın alma şartındaki fiyatın (${fp(limit)}) üstüne çıkamaz, eklenmedi.`);
         continue;
       }
       for (const { f, raw } of discounts) if (raw !== "") line[`discount${f[1]}` as "discount1"] = parseDecimal(raw)!;
@@ -402,6 +509,13 @@ const stockUnitOf = (item: ErpProduct) => {
 // Satılabilir: H stokta kartın değeri; D (drop) stokta kart değeri yoksa depoya alınmış mevcut stoktan rezerve düşülür.
 const sellableOf = (item: ErpProduct) =>
   item.sellableQuantity ?? Math.max(0, (item.stockQuantity ?? 0) - (item.customerOrderQuantity ?? 0));
+// Modaldan eklerken seçili birim (Koli/Palet) satıra birim olarak yazılır; fiyat ve şart sınırı katsayıyla çevrilir, miktar 1 kalır.
+const addWithListUnit = async (product: ErpProduct) => {
+  await addLine(product);
+  const line = lines.value[lines.value.length - 1];
+  const unit = line?.units.find((u) => u.name.toLocaleLowerCase("tr") === stockListUnit.value.toLocaleLowerCase("tr"));
+  if (line && unit && unit.pntr !== line.unitPntr) changeUnit(line, unit.pntr);
+};
 const uq = (item: ErpProduct, base: number) => formatQuantity(Math.round((base / stockUnitOf(item).factor) * 100) / 100);
 // Satılabilir miktarın üstüne gelince depo dağılımı / rezerve / tedarik siparişi açılır.
 const stockHoverCode = ref<string | null>(null);
@@ -443,7 +557,7 @@ const toggleStockList = (code: string, checked: boolean | "indeterminate") => {
 const addFromStockList = async () => {
   stockListAdding.value = true;
   try {
-    for (const item of stockListItems.value.filter((i) => stockListSelected.value.includes(i.code))) await addLine(item);
+    for (const item of stockListItems.value.filter((i) => stockListSelected.value.includes(i.code))) await addWithListUnit(item);
     stockListOpen.value = false;
   } finally {
     stockListAdding.value = false;
@@ -492,13 +606,15 @@ const addLine = async (product: ErpProduct) => {
   const percents = info?.conditionDiscountPercents ?? [];
   lines.value.push({
     id: null,
+    deliveredQuantity: 0,
+    open: true,
     productCode: product.code,
     productName: product.name ?? product.code,
     unitPntr: info?.unitPntr ?? 1,
     units: unitsOf(info),
     quantity: 1,
     // Legacy sırası: açık satın alma şartı > 1 numaralı liste fiyatı > 0.
-    unitPrice: info?.conditionUnitPrice ?? info?.listPrice ?? 0,
+    unitPrice: fromTl(info?.conditionUnitPrice ?? info?.listPrice ?? 0),
     discount1: percents[0] ?? 0,
     discount2: percents[1] ?? 0,
     discount3: percents[2] ?? 0,
@@ -528,7 +644,7 @@ function unitsOf(info: { unitName1: string | null; unitName2: string | null;
   ].filter((u) => u.pntr === 1 || u.name.trim().length > 0);
 }
 
-const removeLine = (index: number) => lines.value.splice(index, 1);
+const removeLine = (index: number) => { if (!isPersisted(lines.value[index]!)) lines.value.splice(index, 1); };
 
 // Fiyat seçili birim başınadır: Adet → Koli geçişinde adet fiyatı kalırsa evrak 1/katsayı tutarla yazılırdı.
 const changeUnit = (line: EditorLine, pntr: number) => {
@@ -544,7 +660,7 @@ const bulkUnitNote = ref("");
 const applyBulkUnit = (name: string) => {
   const wanted = name.toLocaleLowerCase("tr");
   const noUnit: string[] = [];
-  for (const line of lines.value) {
+  for (const line of editableLines.value) {
     const unit = line.units.find((u) => u.name.toLocaleLowerCase("tr") === wanted);
     if (!unit) { noUnit.push(line.productCode); continue; }
     if (unit.pntr !== line.unitPntr) changeUnit(line, unit.pntr);
@@ -572,7 +688,7 @@ const applyBulkDiscount = () => {
   if (values.some((v, i) => bulkDiscountInputs.value[i]!.trim() !== "" && (v === null || v < 0 || v >= 100))) {
     bulkDiscountError.value = "İskontolar %0–99 arasında olmalı."; return;
   }
-  for (const line of lines.value) {
+  for (const line of editableLines.value) {
     if (values[0] != null) line.discount1 = values[0]!;
     if (values[1] != null) line.discount2 = values[1]!;
     if (values[2] != null) line.discount3 = values[2]!;
@@ -608,11 +724,14 @@ const applyNetPrice = (line: EditorLine, input: HTMLInputElement, includesTax: b
   nextTick(() => { input.value = formatUnitPrice(includesTax ? netUnitPriceWithTax(line) : netUnitPrice(line)); });
 };
 // ÖNEMLİ KURAL: birim fiyat satın alma şartındaki birim fiyatın üstüne çıkamaz; altına inebilir (FEATURES.md).
-const overMaxPrice = (line: EditorLine) => line.maxUnitPrice !== null && line.unitPrice > line.maxUnitPrice + 0.00001;
+// Şart fiyatı TL'dir; kontrol seçili para biriminde yapılır (üst sınır = şart TL ÷ kur).
+const capOf = (line: EditorLine) => (line.maxUnitPrice === null ? null : line.maxUnitPrice / (exchangeRate.value || 1));
+const overMaxPrice = (line: EditorLine) => { const cap = capOf(line); return cap !== null && line.unitPrice > cap + 0.0001; };
 const clampUnitPrice = (line: EditorLine) => {
   if (!overMaxPrice(line)) return;
-  errorText.value = `${line.productCode}: birim fiyat satın alma şartındaki fiyatın (${formatMoney(line.maxUnitPrice)}) üstüne çıkamaz.`;
-  line.unitPrice = line.maxUnitPrice!;
+  const cap = capOf(line)!;
+  errorText.value = `${line.productCode}: birim fiyat satın alma şartındaki fiyatın (${fp(cap)}) üstüne çıkamaz.`;
+  line.unitPrice = Math.floor(cap * 10000) / 10000;
 };
 const lineTax = (line: EditorLine) => (lineNet(line) * line.taxPercent) / 100;
 
@@ -632,6 +751,10 @@ watch(() => props.detail, async (detail) => {
   supplierTitle.value = header.supplierTitle ?? "";
   addressNo.value = header.addressNo ?? null;
   projectCode.value = header.projectCode ?? NONE;
+  await ratesReady;
+  currencyCode.value = header.currencyCode ?? "TRY";
+  // Düzenlemede evrakın kuru korunur; çoğaltmada kur bugünün kuruna güncellenir (fiyatlar para biriminde kalır).
+  exchangeRate.value = props.copy ? (rateOf(currencyCode.value) || header.exchangeRate || 1) : (header.exchangeRate ?? 1);
   deliveryDate.value = header.deliveryDate?.slice(0, 10) ?? addDays(3);
   note1.value = header.note1 ?? "";
   headerDepot.value = detail.lines[0]?.depotNo ?? defaultDepot();
@@ -641,6 +764,8 @@ watch(() => props.detail, async (detail) => {
     const percents = discountPercentsOf(line);
     return {
       id: line.id,
+      deliveredQuantity: line.deliveredQuantity ?? 0,
+      open: line.open ?? true,
       productCode: line.productCode ?? "",
       productName: line.productName ?? line.productCode ?? "",
       unitPntr: line.unitPntr ?? 1,
@@ -681,15 +806,16 @@ const submit = () => {
   errorText.value = "";
   if (!supplierCode.value) { errorText.value = "Cari geçersiz."; return; }
   if (!addressNo.value) { errorText.value = "Adres geçersiz."; return; }
+  if (!(exchangeRate.value > 0)) { errorText.value = "Kur sıfırdan büyük olmalı."; return; }
   if (!series.value.trim()) { errorText.value = "Evrak serisi seçilmedi."; return; }
   if (lines.value.length === 0) { errorText.value = "En az bir satır ekleyin."; return; }
   // v-model.number boşaltılan hücrede "" bırakır; Number.isFinite onu da yakalar (satış formuyla aynı).
-  if (lines.value.some((l) => !Number.isInteger(l.quantity) || l.quantity <= 0)) { errorText.value = "Miktar tam sayı ve sıfırdan büyük olmalı."; return; }
-  const over = lines.value.find(overMaxPrice);
+  if (editableLines.value.some((l) => !Number.isInteger(l.quantity) || l.quantity <= 0)) { errorText.value = "Miktar tam sayı ve sıfırdan büyük olmalı."; return; }
+  const over = editableLines.value.find(overMaxPrice);
   if (over) { errorText.value = `${over.productCode}: birim fiyat satın alma şartındaki fiyatın üstüne çıkamaz.`; return; }
-  if (lines.value.some((l) => !Number.isFinite(l.unitPrice) || l.unitPrice < 0)) { errorText.value = "Birim fiyat boş ya da negatif olamaz."; return; }
-  if (lines.value.some((l) => discountsOf(l).some((v) => !Number.isFinite(v) || v < 0 || v >= 100))) { errorText.value = "İskontolar %0–99 arasında olmalı."; return; }
-  if ([deliveryDate.value, ...lines.value.map((l) => l.deliveryDate)].some((d) => d && d < localIsoDate())) {
+  if (editableLines.value.some((l) => !Number.isFinite(l.unitPrice) || l.unitPrice < 0)) { errorText.value = "Birim fiyat boş ya da negatif olamaz."; return; }
+  if (editableLines.value.some((l) => discountsOf(l).some((v) => !Number.isFinite(v) || v < 0 || v >= 100))) { errorText.value = "İskontolar %0–99 arasında olmalı."; return; }
+  if (editableLines.value.length && [deliveryDate.value, ...editableLines.value.map((l) => l.deliveryDate)].some((d) => d && d < localIsoDate())) {
     errorText.value = "Teslim tarihi, sipariş tarihinden önce olamaz.";
     return;
   }
@@ -697,6 +823,8 @@ const submit = () => {
   emit("submit", {
     orderSeries: series.value.trim(),
     orderNumber: props.detail?.header?.orderNumber ?? null,
+    currencyCode: currencyCode.value,
+    exchangeRate: exchangeRate.value,
     supplierCode: supplierCode.value,
     addressNo: addressNo.value,
     paymentPlanNo: props.detail?.header?.paymentPlanNo ?? 0,
@@ -800,6 +928,22 @@ defineExpose({ submit });
           <Input id="po-delivery" :model-value="deliveryDate" type="date" @update:model-value="setHeaderDelivery" />
         </div>
 
+        <div class="space-y-1.5">
+          <Label for="po-currency">Para Birimi</Label>
+          <Select :model-value="currencyCode" :disabled="isEdit" @update:model-value="(v) => setCurrency(String(v))">
+            <SelectTrigger id="po-currency"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem v-for="c in CURRENCIES" :key="c.code" :value="c.code">{{ c.name }}</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div v-if="isForeign" class="space-y-1.5">
+          <Label for="po-rate">Kur (1 {{ currencyCode }} = ? ₺)</Label>
+          <Input id="po-rate" v-model.number="exchangeRate" type="number" min="0" step="0.0001" :disabled="isEdit" class="font-mono" />
+          <p class="text-[11px] text-ink-muted">Günün kuru önerilir, değiştirilebilir. Kayıttan sonra kur kilitlenir.</p>
+        </div>
+
 
         <div class="space-y-1.5">
           <Label for="po-project">Proje</Label>
@@ -842,6 +986,7 @@ defineExpose({ submit });
             <Checkbox v-model="onlySupplierProducts" :disabled="!supplierCode" aria-label="Yalnız bu tedarikçinin ürünleri" />
             Yalnız bu tedarikçinin ürünleri
           </label>
+          <Button v-if="isEdit" variant="secondary" size="sm" :disabled="!lines.some((l) => isPersisted(l) && l.open)" @click="openClose(lines)">Siparişi kapat</Button>
           <!-- Yalnız buton: indirme API/backend tarafında yapılacak (prototipte işlevi yok). -->
           <Button variant="secondary" size="sm" :disabled="!lines.length">Excel indir</Button>
           <Button variant="secondary" size="sm" :disabled="!supplierCode" :title="supplierCode ? '' : 'Önce tedarikçi seçin'" @click="openPaste">Excel'den yapıştır</Button>
@@ -866,7 +1011,7 @@ defineExpose({ submit });
               </div>
             </PopoverContent>
           </Popover>
-          <Button variant="secondary" size="sm" :disabled="!lines.length" @click="clearAllLines">
+          <Button variant="secondary" size="sm" :disabled="!lines.some((l) => !isPersisted(l))" :title="isEdit && lines.length && lines.every(isPersisted) ? 'Kayıtlı satırlar silinemez, kapatılabilir' : ''" @click="clearAllLines">
             <Trash2 class="mr-1.5 size-4" /> Tümünü temizle
           </Button>
         </div>
@@ -891,6 +1036,7 @@ defineExpose({ submit });
         </Popover>
         </div>
 
+        <p v-if="closeNote" class="rounded border border-sky-300 bg-sky-50 px-3 py-2 text-[12px] text-sky-900">{{ closeNote }}</p>
         <p v-if="bulkUnitNote" class="rounded border border-amber-300 bg-amber-50 px-3 py-2 text-[12px] text-amber-800">{{ bulkUnitNote }}</p>
 
         <div class="min-w-0 overflow-x-auto">
@@ -912,7 +1058,7 @@ defineExpose({ submit });
                   </div>
                 </th>
                 <th class="py-2 pr-4 text-right">Miktar</th>
-                <th class="py-2 pr-4 text-right">Birim Fiyat</th>
+                <th class="py-2 pr-4 text-right">Birim Fiyat <span class="font-normal text-ink-muted">({{ currencySymbol }})</span></th>
                 <th class="py-2 pr-4 text-right">İsk 1 %</th>
                 <th class="py-2 pr-4 text-right">İsk 2 %</th>
                 <th class="py-2 pr-4 text-right">İsk 3 %</th>
@@ -926,13 +1072,14 @@ defineExpose({ submit });
               </tr>
             </thead>
             <tbody>
-              <tr v-for="(line, index) in lines" :key="`${line.productCode}-${index}`" class="border-b border-line/60">
-                <td class="py-2 pr-4">
+              <tr v-for="(line, index) in lines" :key="`${line.productCode}-${index}`" class="border-b border-line/60" :class="isLocked(line) ? 'bg-surface-2 [&>td[inert]]:opacity-60' : ''">
+                <td :inert="isLocked(line)" class="py-2 pr-4">
                   <div class="font-mono text-[12px]">{{ line.productCode }}</div>
                   <div class="truncate text-[12px] text-ink-muted">{{ line.productName }}</div>
                   <Badge v-if="line.fromCondition" variant="secondary" class="mt-1">Alış şartı</Badge>
+                  <Badge v-if="isLocked(line)" variant="outline" class="mt-1 border-amber-400 text-amber-800" :title="'Müdahale edilemez: ' + lockReason(line)">🔒 {{ lockReason(line) }}</Badge>
                 </td>
-                <td class="py-2 pr-4">
+                <td :inert="isLocked(line)" class="py-2 pr-4">
                   <Select :model-value="line.unitPntr" @update:model-value="changeUnit(line, Number($event))">
                     <SelectTrigger class="h-8 w-28"><SelectValue /></SelectTrigger>
                     <SelectContent>
@@ -940,7 +1087,7 @@ defineExpose({ submit });
                     </SelectContent>
                   </Select>
                 </td>
-                <td class="py-2 pr-4 text-right">
+                <td :inert="isLocked(line)" class="py-2 pr-4 text-right">
                   <Input
                     v-model.number="line.quantity" type="number" min="1" step="1" inputmode="numeric"
                     class="h-8 w-24 text-right font-mono" :class="caseBreak(line) ? 'border-amber-500' : ''"
@@ -948,38 +1095,38 @@ defineExpose({ submit });
                   />
                   <p v-if="caseBreak(line)" class="mt-0.5 w-24 text-right text-[11px] leading-tight text-amber-700">Koli bozuluyor (koli içi {{ caseBreak(line) }})</p>
                 </td>
-                <td class="py-2 pr-4 text-right">
+                <td :inert="isLocked(line)" class="py-2 pr-4 text-right">
                   <Input
                     v-model.number="line.unitPrice" type="number" step="0.001" min="0" class="h-8 w-28 text-right font-mono"
                     @change="clampUnitPrice(line)"
                   />
-                  <p v-if="line.maxUnitPrice !== null" class="mt-0.5 w-28 text-right text-[11px] leading-tight text-ink-muted">Şart üst sınırı: {{ formatMoney(line.maxUnitPrice) }}</p>
+                  <p v-if="line.maxUnitPrice !== null" class="mt-0.5 w-28 text-right text-[11px] leading-tight text-ink-muted">Şart üst sınırı: {{ fp(capOf(line)!) }}</p>
                 </td>
-                <td class="py-2 pr-4 text-right">
+                <td :inert="isLocked(line)" class="py-2 pr-4 text-right">
                   <Input
                     v-model.number="line.discount1" type="number" step="0.01" min="0" class="h-8 w-20 text-right font-mono"
                     @focus="clearIfZero" @blur="restoreZero(line, 'discount1', $event)"
                   />
                 </td>
-                <td class="py-2 pr-4 text-right">
+                <td :inert="isLocked(line)" class="py-2 pr-4 text-right">
                   <Input
                     v-model.number="line.discount2" type="number" step="0.01" min="0" class="h-8 w-20 text-right font-mono"
                     @focus="clearIfZero" @blur="restoreZero(line, 'discount2', $event)"
                   />
                 </td>
-                <td class="py-2 pr-4 text-right">
+                <td :inert="isLocked(line)" class="py-2 pr-4 text-right">
                   <Input
                     v-model.number="line.discount3" type="number" step="0.01" min="0" class="h-8 w-20 text-right font-mono"
                     @focus="clearIfZero" @blur="restoreZero(line, 'discount3', $event)"
                   />
                 </td>
-                <td class="py-2 pr-4 text-right">
+                <td :inert="isLocked(line)" class="py-2 pr-4 text-right">
                   <Input
                     v-model.number="line.discount4" type="number" step="0.01" min="0" class="h-8 w-20 text-right font-mono"
                     @focus="clearIfZero" @blur="restoreZero(line, 'discount4', $event)"
                   />
                 </td>
-                <td class="py-2 pr-4 text-right">
+                <td :inert="isLocked(line)" class="py-2 pr-4 text-right">
                   <Input
                     type="text" inputmode="decimal" class="mb-1 h-7 w-28 text-right font-mono" aria-label="KDV hariç net birim fiyat"
                     :model-value="formatUnitPrice(netUnitPrice(line))" @change="applyNetPrice(line, $event.target as HTMLInputElement, false)"
@@ -989,11 +1136,11 @@ defineExpose({ submit });
                     :model-value="formatUnitPrice(netUnitPriceWithTax(line))" @change="applyNetPrice(line, $event.target as HTMLInputElement, true)"
                   />
                 </td>
-                <td class="py-2 pr-4 text-right font-mono tabular-nums text-ink-muted">%{{ line.taxPercent }}</td>
-                <td class="py-2 pr-4 text-right font-mono tabular-nums text-ink-muted">
+                <td :inert="isLocked(line)" class="py-2 pr-4 text-right font-mono tabular-nums text-ink-muted">%{{ line.taxPercent }}</td>
+                <td :inert="isLocked(line)" class="py-2 pr-4 text-right font-mono tabular-nums text-ink-muted">
                   {{ line.lastPurchasePrice === null ? "—" : formatMoney(line.lastPurchasePrice) }}
                 </td>
-                <td class="py-2 pr-4">
+                <td :inert="isLocked(line)" class="py-2 pr-4">
                   <Select v-model="line.depotNo">
                     <SelectTrigger class="mb-1 h-7 w-36"><SelectValue /></SelectTrigger>
                     <SelectContent>
@@ -1002,14 +1149,24 @@ defineExpose({ submit });
                   </Select>
                   <Input v-model="line.deliveryDate" type="date" class="h-7 w-36" aria-label="Teslim tarihi" />
                 </td>
-                <td class="py-2 pr-4 text-right font-mono tabular-nums">
+                <td :inert="isLocked(line)" class="py-2 pr-4 text-right font-mono tabular-nums">
                   {{ formatMoney(lineNet(line) + lineTax(line)) }}
                 </td>
                 <td class="whitespace-nowrap py-2 text-right">
                   <Button variant="ghost" size="sm" title="Alış faturaları ve satış hareketleri" aria-label="Stok geçmişi" @click="openHistory(line)">
                     <History class="size-4" />
                   </Button>
-                  <Button variant="ghost" size="sm" @click="removeLine(index)">
+                  <Button
+                    v-if="isPersisted(line) && line.open" variant="ghost" size="sm" title="Satırı kapat" aria-label="Satırı kapat"
+                    @click="openClose([line])"
+                  >
+                    <Lock class="size-4" />
+                  </Button>
+                  <Button
+                    variant="ghost" size="sm" :disabled="isPersisted(line)"
+                    :title="isPersisted(line) ? 'Kayıtlı satır silinemez, kapatılabilir' : 'Satırı sil'" aria-label="Satırı sil"
+                    @click="removeLine(index)"
+                  >
                     <Trash2 class="size-4" />
                   </Button>
                 </td>
@@ -1022,16 +1179,17 @@ defineExpose({ submit });
         </div>
 
         <div class="flex flex-wrap justify-end gap-6 border-t border-line pt-3 text-[13px]">
-          <div><span class="text-ink-muted">Brüt:</span> <span class="font-mono tabular-nums">{{ formatMoney(totals.gross) }}</span></div>
-          <div><span class="text-ink-muted">İskonto:</span> <span class="font-mono tabular-nums">{{ formatMoney(totals.discount) }}</span></div>
-          <div><span class="text-ink-muted">KDV:</span> <span class="font-mono tabular-nums">{{ formatMoney(totals.tax) }}</span></div>
-          <div class="font-medium"><span class="text-ink-muted">Genel Toplam:</span> <span class="font-mono tabular-nums">{{ formatMoney(totals.net) }}</span></div>
+          <div><span class="text-ink-muted">Brüt:</span> <span class="font-mono tabular-nums">{{ fm(totals.gross) }}</span></div>
+          <div><span class="text-ink-muted">İskonto:</span> <span class="font-mono tabular-nums">{{ fm(totals.discount) }}</span></div>
+          <div><span class="text-ink-muted">KDV:</span> <span class="font-mono tabular-nums">{{ fm(totals.tax) }}</span></div>
+          <div class="font-medium"><span class="text-ink-muted">Genel Toplam:</span> <span class="font-mono tabular-nums">{{ fm(totals.net) }}</span></div>
+          <div v-if="isForeign" class="text-ink-muted">TL karşılığı: <span class="font-mono tabular-nums">{{ formatMoney(totals.net * exchangeRate) }} ₺</span></div>
         </div>
       </CardContent>
     </Card>
 
     <Dialog v-model:open="pickerOpen">
-      <DialogContent class="max-w-4xl">
+      <DialogContent class="max-w-6xl">
         <DialogHeader>
           <DialogTitle>Stok Seç</DialogTitle>
           <DialogDescription>"{{ productSearch.trim() }}" aramasına uyan stoklar — siparişe eklenecekleri işaretleyin.</DialogDescription>
@@ -1045,6 +1203,11 @@ defineExpose({ submit });
                 <th class="py-2 pr-2">Stok Kodu</th>
                 <th class="py-2 pr-2">Barkod</th>
                 <th class="py-2 pr-2">Stok Adı</th>
+                <th class="py-2 pr-3">Birim</th>
+                <th class="py-2 pr-3 text-right">Fiziksel Stok</th>
+                <th v-for="d in pickerDepots" :key="d.no" class="py-2 pr-3 text-right">{{ d.name }}</th>
+                <th class="py-2 pr-3 text-right">Bekleyen Satış Siparişi</th>
+                <th class="py-2 pr-3 text-right">Bekleyen Satın Alma Siparişi</th>
               </tr>
             </thead>
             <tbody>
@@ -1055,10 +1218,24 @@ defineExpose({ submit });
                 <td class="py-1.5 pr-2 font-mono text-[12px]">{{ item.code }}</td>
                 <td class="py-1.5 pr-2 font-mono text-[12px] text-ink-muted">{{ item.masterBarcode || "—" }}</td>
                 <td class="py-1.5 pr-2">{{ item.name }}</td>
+                <td class="py-1.5 pr-3 text-[12px]">{{ stockUnitOf(item).name }}</td>
+                <td class="py-1.5 pr-3 text-right font-mono tabular-nums">{{ uq(item, item.stockQuantity ?? 0) }}</td>
+                <td v-for="d in pickerDepots" :key="d.no" class="py-1.5 pr-3 text-right font-mono tabular-nums">{{ uq(item, item.depotBalances?.find((b) => b.depotNo === d.no)?.quantity ?? 0) }}</td>
+                <td class="py-1.5 pr-3 text-right font-mono tabular-nums">
+                  <button type="button" class="underline decoration-dotted underline-offset-4 hover:text-action-deep" title="Bekleyen satış siparişi detayı" @click="openStockOrderDetail(item, 'received')">{{ uq(item, item.customerOrderQuantity ?? 0) }}</button>
+                </td>
+                <td class="py-1.5 pr-3 text-right font-mono tabular-nums">
+                  <button type="button" class="underline decoration-dotted underline-offset-4 hover:text-action-deep" title="Bekleyen satın alma siparişi detayı" @click="openStockOrderDetail(item, 'given')">{{ uq(item, item.incomingOrderQuantity ?? 0) }}</button>
+                </td>
               </tr>
             </tbody>
           </table>
         </div>
+        <div class="flex items-center gap-1">
+          <span class="mr-1 text-[12px] text-ink-muted">Birim:</span>
+          <Button v-for="u in (['Adet', 'Koli', 'Palet'] as const)" :key="u" size="sm" :variant="stockListUnit === u ? 'default' : 'secondary'" @click="stockListUnit = u">{{ u }}</Button>
+        </div>
+        <p class="text-[11px] text-ink-muted">Miktarlar Birim sütunundaki birimle gösterilir (stokta seçilen birim tanımlı değilse Adet). Fiziksel stok = depolardaki toplam; Bekleyen satış siparişi = müşterilerden alınıp henüz sevk edilmemiş açık sipariş (rezerve); Bekleyen satın alma siparişi = tedarikçilere verilip henüz teslim alınmamış açık sipariş. Miktara tıklayınca evrak detayı açılır.</p>
         <DialogFooter class="items-center sm:justify-between">
           <span class="text-[13px] text-ink-muted">{{ pickerSelected.length }} stok seçildi</span>
           <div class="flex gap-2">
@@ -1277,6 +1454,111 @@ defineExpose({ submit });
         <DialogFooter>
           <Button variant="secondary" @click="pasteOpen = false">Kapat</Button>
           <Button :disabled="!pasteText.trim() || pasteBusy" @click="importPasted">{{ pasteBusy ? "Kontrol ediliyor…" : "Kontrol et ve ekle" }}</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+    <Dialog v-model:open="closeDialogOpen">
+      <DialogContent class="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{{ closeTargets.length > 1 ? "Siparişi Kapat" : "Satırı Kapat" }}</DialogTitle>
+          <DialogDescription>
+            {{ closeTargets.length }} açık satır kapatılacak; teslim alınmamış kalan miktar artık beklenmez. Kapatma <strong>anında uygulanır</strong> (Kaydet gerekmez) ve geri alınamaz.
+          </DialogDescription>
+        </DialogHeader>
+        <ul class="max-h-40 space-y-1 overflow-auto rounded border border-line p-2 text-[12px]">
+          <li v-for="l in closeTargets" :key="l.id ?? l.productCode" class="flex justify-between gap-3">
+            <span class="truncate"><span class="font-mono">{{ l.productCode }}</span> {{ l.productName }}</span>
+            <span class="shrink-0 font-mono tabular-nums text-ink-muted">kalan {{ formatQuantity(Math.max(0, l.quantity - l.deliveredQuantity)) }}</span>
+          </li>
+        </ul>
+        <div class="space-y-1.5">
+          <Label for="close-reason">Kapatma nedeni</Label>
+          <Select v-model="closeReason">
+            <SelectTrigger id="close-reason"><SelectValue placeholder="Neden seçin" /></SelectTrigger>
+            <SelectContent>
+              <SelectItem v-for="r in closeReasonList" :key="r.code" :value="r.code">{{ r.name ?? r.code }}</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+        <DialogFooter>
+          <Button variant="secondary" @click="closeDialogOpen = false">Vazgeç</Button>
+          <Button :disabled="!closeReason || closeBusy" @click="confirmClose">{{ closeBusy ? "Kapatılıyor…" : "Kapat" }}</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+    <Dialog v-model:open="orderDetailOpen">
+      <DialogContent class="max-w-6xl">
+        <DialogHeader>
+          <DialogTitle>Açıkta Bekleyen Siparişler — <span class="font-mono">{{ orderDetailItem?.code }}</span></DialogTitle>
+          <DialogDescription>{{ orderDetailItem?.name }}</DialogDescription>
+        </DialogHeader>
+        <div class="flex items-center gap-1">
+          <span class="mr-1 text-[12px] text-ink-muted">Birim:</span>
+          <Button v-for="u in (['Adet', 'Koli', 'Palet'] as const)" :key="u" size="sm" :variant="stockListUnit === u ? 'default' : 'secondary'" @click="stockListUnit = u">{{ u }}</Button>
+          <span class="ml-4 mr-1 text-[12px] text-ink-muted">Depo:</span>
+          <Select v-model="orderDetailDepot">
+            <SelectTrigger class="h-7 w-44 text-xs" aria-label="Depo filtresi"><SelectValue placeholder="Tüm depolar" /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="ALL">Tüm depolar</SelectItem>
+              <SelectItem v-for="d in lookups?.depots ?? []" :key="d.no" :value="d.name">{{ d.name }}</SelectItem>
+            </SelectContent>
+          </Select>
+          <span v-if="orderDetailItem && stockUnitOf(orderDetailItem).name !== stockListUnit" class="ml-2 text-[12px] text-ink-muted">Bu stokta {{ stockListUnit }} tanımlı değil, Adet gösteriliyor.</span>
+        </div>
+        <Tabs v-if="orderDetailItem" v-model="orderDetailTab">
+          <TabsList class="mb-3">
+            <TabsTrigger value="received">Bekleyen Satış Siparişleri ({{ orderDetailRows("received").length }})</TabsTrigger>
+            <TabsTrigger value="given">Bekleyen Satın Alma Siparişleri ({{ orderDetailRows("given").length }})</TabsTrigger>
+          </TabsList>
+          <TabsContent v-for="kind in (['received', 'given'] as const)" :key="kind" :value="kind" class="space-y-3">
+            <p v-if="stockOrdersCache[orderDetailItem.code] === 'error'" class="text-[13px] text-red-700">Sipariş detayı yüklenemedi.</p>
+            <p v-else-if="!stockOrdersOf(orderDetailItem.code)" class="p-6 text-center text-[13px] text-ink-muted">Yükleniyor…</p>
+            <p v-else-if="!orderDetailRows(kind).length" class="p-6 text-center text-[13px] text-ink-muted">{{ orderDetailDepot === "ALL" ? "Açıkta bekleyen sipariş yok." : "Seçilen depoda açıkta bekleyen sipariş yok." }}</p>
+            <template v-else>
+              <div class="grid grid-cols-3 gap-3 text-[13px]">
+                <div class="rounded border border-line p-3"><div class="text-[11px] uppercase text-ink-muted">Açık evrak</div><div class="font-mono text-[16px] font-semibold">{{ orderDetailTotals(kind).count }}</div></div>
+                <div class="rounded border border-line p-3"><div class="text-[11px] uppercase text-ink-muted">{{ kind === "received" ? "Sevk bekleyen miktar" : "Teslim bekleyen miktar" }}</div><div class="font-mono text-[16px] font-semibold">{{ uq(orderDetailItem, orderDetailTotals(kind).waiting) }}</div></div>
+                <div class="rounded border border-line p-3"><div class="text-[11px] uppercase text-ink-muted">Bekleyen tutar (KDV hariç)</div><div class="font-mono text-[16px] font-semibold">{{ formatMoney(orderDetailTotals(kind).amount) }} ₺</div></div>
+              </div>
+              <div class="max-h-[45vh] overflow-auto rounded border border-line">
+                <table class="w-full whitespace-nowrap text-[13px]">
+                  <thead class="sticky top-0 bg-surface-2">
+                    <tr class="border-b border-line text-left text-[11px] uppercase tracking-wide text-ink-muted">
+                      <th class="py-2 pl-3 pr-3">Evrak</th>
+                      <th class="py-2 pr-3">Tarih</th>
+                      <th class="py-2 pr-3">{{ kind === "received" ? "Müşteri" : "Tedarikçi" }}</th>
+                      <th class="py-2 pr-3">Depo</th>
+                      <th class="py-2 pr-3">{{ kind === "received" ? "Temsilci" : "Sipariş Veren" }}</th>
+                      <th class="py-2 pr-3 text-right">Sipariş</th>
+                      <th class="py-2 pr-3 text-right">Bekleyen</th>
+                      <th class="py-2 pr-3 text-right">Birim Fiyat</th>
+                      <th class="py-2 pr-3 text-right">İsk 1 / 2 / 3 / 4 %</th>
+                      <th class="py-2 pr-3 text-right">Bekleyen Tutar (KDV hariç)</th>
+                      <th class="py-2 pr-3">Teslim Tarihi</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="r in orderDetailRows(kind)" :key="r.documentNo" class="border-b border-line last:border-0">
+                      <td class="py-1.5 pl-3 pr-3 font-mono text-[12px]">{{ r.documentNo }}</td>
+                      <td class="py-1.5 pr-3 font-mono text-[12px]">{{ formatDate(r.orderDate) }}</td>
+                      <td class="py-1.5 pr-3">{{ r.partyTitle }}</td>
+                      <td class="py-1.5 pr-3">{{ r.depotName }}</td>
+                      <td class="py-1.5 pr-3 text-[12px] uppercase">{{ r.ownerName ?? "—" }}</td>
+                      <td class="py-1.5 pr-3 text-right font-mono tabular-nums">{{ uq(orderDetailItem, r.quantity) }}</td>
+                      <td class="py-1.5 pr-3 text-right font-mono font-semibold tabular-nums">{{ uq(orderDetailItem, waitingOf(r)) }}</td>
+                      <td class="py-1.5 pr-3 text-right font-mono tabular-nums">{{ formatMoney(r.unitPrice * stockUnitOf(orderDetailItem).factor) }} ₺</td>
+                      <td class="py-1.5 pr-3 text-right font-mono tabular-nums text-ink-muted">{{ [0, 1, 2, 3].map((n) => r.discountPercents[n] ?? 0).join(" / ") }}</td>
+                      <td class="py-1.5 pr-3 text-right font-mono tabular-nums">{{ formatMoney(applyDiscountChain(waitingOf(r) * r.unitPrice, r.discountPercents)) }} ₺</td>
+                      <td class="py-1.5 pr-3 font-mono text-[12px]">{{ formatDate(r.deliveryDate) }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </template>
+          </TabsContent>
+        </Tabs>
+        <DialogFooter>
+          <Button variant="secondary" @click="orderDetailOpen = false">Kapat</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

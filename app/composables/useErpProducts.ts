@@ -72,6 +72,8 @@ export interface ErpProduct {
   stockType?: "H" | "D" | null;
   /** Satılabilir miktar (yalnız H stoklar için). */
   sellableQuantity?: number | null;
+  /** Tedarikçilere verilmiş açık satın alma siparişlerinin toplam sipariş miktarı (teslim alınanlar dahil). */
+  purchaseOrderedQuantity?: number | null;
   /** Açık tedarik (satınalma) siparişi — bekleyen giriş. */
   incomingOrderQuantity?: number | null;
   /** Açık müşteri siparişi — rezerve, bekleyen çıkış. */

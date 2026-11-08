@@ -21,6 +21,11 @@ export interface ErpPurchaseOrder {
   projectCode: string | null;
   openLineCount: number;
   closedLineCount: number;
+  /** Sipariş edilen / teslim alınan toplam miktar (temel birim). Liste ucunun döndürmesi beklenir; yoksa durum satır sayılarından çıkarılır. */
+  orderedQuantity?: number | null;
+  /** Siparişin satırlarındaki depo numaraları (depo filtresi için); liste ucunun döndürmesi beklenir. */
+  depotNos?: number[] | null;
+  deliveredQuantity?: number | null;
   note1: string | null;
   note2: string | null;
   note9: string | null;
@@ -32,6 +37,9 @@ export interface ErpPurchaseOrder {
   representativeCode: string | null;
   costCenterCode: string | null;
   documentNo: string | null;
+  /** Sipariş para birimi (TRY / USD / EUR) ve kuru (1 birim = ? TL). Mikro: sip_doviz_cinsi / sip_doviz_kuru. Yoksa TRY / 1. */
+  currencyCode?: string | null;
+  exchangeRate?: number | null;
 }
 
 export interface ErpPurchaseOrderLine {
@@ -92,6 +100,9 @@ export interface ErpCloseReason {
 
 /** Kesit 15 · ekran 06 — evrak formunun kaydettiği yük. */
 export interface ErpPurchaseOrderSavePayload {
+  /** Para birimi ve kur (1 birim = ? TL); satırdaki fiyatlar bu para birimindedir. */
+  currencyCode: string;
+  exchangeRate: number;
   orderSeries: string;
   orderNumber: number | null;
   supplierCode: string;
@@ -177,6 +188,28 @@ export interface ErpStockSalesHistory {
   sellableQuantity: number;
   /** Son 12 ay, yeniden eskiye. */
   items: ErpStockSalesMovement[];
+}
+
+/** Stoğa ait açık siparişler: müşterilerden alınan (rezerve) ve tedarikçilere verilen (satın alma). Miktarlar temel birim (adet). */
+export interface ErpStockOrderRow {
+  orderDate: string;
+  documentNo: string;
+  /** Alınan siparişte müşteri, verilen siparişte tedarikçi unvanı. */
+  partyTitle: string;
+  quantity: number;
+  deliveredQuantity: number;
+  deliveryDate: string | null;
+  /** Siparişin verildiği / teslim edileceği depo. */
+  depotName: string;
+  /** İskonto öncesi birim fiyat (KDV hariç, temel birim = adet başına). */
+  unitPrice: number;
+  discountPercents: number[];
+  /** Alınan siparişte satış temsilcisi, verilen siparişte siparişi veren kullanıcı. */
+  ownerName: string | null;
+}
+export interface ErpStockOrders {
+  received: ErpStockOrderRow[];
+  given: ErpStockOrderRow[];
 }
 
 export interface ErpPurchaseOrderPage {
@@ -280,8 +313,15 @@ export const useErpPurchaseOrders = () => {
   const salesHistory = (productCode: string) =>
     api.request<ErpStockSalesHistory>(`${base}/sales-history/${encodeURIComponent(productCode)}`);
 
+  /** Günlük kurlar (1 birim = ? TL), ör. { USD: 43.25, EUR: 47.1 }. Mikro: fn_KurBul. */
+  const exchangeRates = (date?: string) =>
+    api.request<Record<string, number>>(`/api/erp/exchange-rates`, date ? { query: { date } } : {});
+
+  const stockOrders = (productCode: string) =>
+    api.request<ErpStockOrders>(`${base}/stock-orders/${encodeURIComponent(productCode)}`);
+
   return {
-    list, get, closeReasons, updateLine, closeLines, deleteLines, copyRemainder, updateNotes,
+    exchangeRates, stockOrders, list, get, closeReasons, updateLine, closeLines, deleteLines, copyRemainder, updateNotes,
     save, productDefaults, invoiceHistory, salesHistory,
   };
 };

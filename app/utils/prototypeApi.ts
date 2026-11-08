@@ -107,6 +107,7 @@ const PRODUCTS = [
       stockQuantity: onHand,
       customerOrderQuantity: reserved,
       incomingOrderQuantity: (index % 2) * item.casePack * 5,
+      purchaseOrderedQuantity: (index % 2) * item.casePack * 8,
       depotBalances: [{ depotNo: 1, depotName: "İkitelli Depo", depotCode: null, quantity: ikitelli }, { depotNo: 83, depotName: "Plaza Depo", depotCode: null, quantity: onHand - ikitelli }],
     };
   })(),
@@ -125,6 +126,79 @@ const page = <T,>(items: T[], query: Record<string, unknown>) => ({
 });
 
 
+// Kurgu satın alma siparişleri: 24 adet — 8 Bekliyor (hiç teslim yok), 8 Kısmi Teslim Alınan, 8 Teslim Alınan.
+// Başlık tutarları ve satır sayıları satırlardan türetilir; böylece liste ile detay (accordion) birbirini tutar.
+let purchaseOrderCache: { orders: Record<string, any>[]; lines: Map<string, Record<string, any>[]> } | null = null;
+const purchaseOrderData = () => {
+  if (purchaseOrderCache) return purchaseOrderCache;
+  const suppliers = Object.values(SUPPLIERS);
+  const today = new Date();
+  const iso = (offsetDays: number) => new Date(today.getFullYear(), today.getMonth(), today.getDate() + offsetDays).toISOString().slice(0, 10);
+  const lines = new Map<string, Record<string, any>[]>();
+  const salespersons = ["AHMET ERİŞ", "AHMET ERİŞ", "NAMIK ÖZTÜRK", "SELİM AKIN"];
+  const orders = Array.from({ length: 24 }, (_, i) => {
+    const status = i < 8 ? "pending" : i < 16 ? "partial" : "received";
+    const k = status === "pending" ? i : status === "partial" ? i - 8 : i - 16;
+    const supplier = suppliers[(i * 5 + k) % suppliers.length]!;
+    const series = ["SA06", "53", "SA22"][i % 3]!;
+    const number = series === "SA06" ? 17000 + i * 6 : series === "53" ? 1645900 + i * 3 : 3700 + i * 4;
+    // Her 5 siparişten biri USD (kur 43,25): satır fiyatları dolar cinsindendir.
+    const currencyCode = i % 5 === 1 ? "USD" : "TRY";
+    const exchangeRate = currencyCode === "USD" ? 43.25 : 1;
+    const orderAgo = status === "pending" ? 1 + k * 2 : status === "partial" ? 12 + k * 4 : 35 + k * 15;
+    const deliveryDate = iso(status === "pending" ? 10 - k : status === "partial" ? 3 - k * 2 : -(orderAgo - 14));
+    const own = PRODUCTS.filter((p) => budgetTermOf(p.code)?.supplierCode === supplier.supplierCode);
+    const pool = own.length >= 2 ? own : PRODUCTS;
+    const lineCount = Math.min(pool.length, 2 + ((i * 3) % 4));
+
+    const rows = Array.from({ length: lineCount }, (_, j) => {
+      const product = pool[(i * 3 + j) % pool.length]!;
+      const quantity = product.casePack * (2 + ((i + j * 2) % 6));
+      const unitPrice = Math.round(product.price * (0.62 + (j % 3) * 0.01) / exchangeRate * 10000) / 10000;
+      const discounts = [j % 2 === 0 ? 5 : 3, j % 3 === 0 ? 2 : 0, 0, 0];
+      // Gerçek API gibi: lineTotal = iskonto öncesi brüt tutar, discountN = kademeli iskonto TUTARLARI.
+      const grossLine = Math.round(quantity * unitPrice * 100) / 100;
+      let rest = grossLine;
+      const discountAmounts = discounts.map((d) => { const amount = rest * d / 100; rest -= amount; return amount; });
+      const depotNo = [1, 1, 83, 3][(i + j) % 4]!;
+      return { product, quantity, unitPrice, discounts, discountAmounts, grossLine, depotNo, lineTotal: Math.round(rest * 100) / 100, tax: product.tax };
+    });
+    const orderedQuantity = rows.reduce((sum, r) => sum + r.quantity, 0);
+    let remaining = status === "pending" ? 0 : status === "received" ? orderedQuantity : Math.round(orderedQuantity * (0.25 + (k % 4) * 0.2));
+    const deliveredQuantity = remaining;
+    const orderLines = rows.map((r, j) => {
+      const delivered = Math.min(r.quantity, remaining);
+      remaining -= delivered;
+      return {
+        id: `${series}-${number}-${j + 1}`, lineGuid: `${series}-${number}-${j + 1}`, orderSeries: series, orderNumber: number, lineNo: j + 1,
+        productCode: r.product.code, productName: r.product.name, unitPntr: 1, unitName: "Adet", quantity: r.quantity, deliveredQuantity: delivered,
+        unitPrice: r.unitPrice, lineTotal: r.grossLine, discount1: r.discountAmounts[0], discount2: r.discountAmounts[1], discount3: 0, discount4: 0, discount5: 0, discount6: 0,
+        taxPntr: 1, taxPercent: r.tax, taxAmount: Math.round(r.lineTotal * r.tax) / 100, deliveryDate, note1: null, note2: null, projectCode: null,
+        priceListNo: 1, open: delivered < r.quantity, closeReasonCode: null, closeReasonName: null, listPrice: r.product.price, hasActiveInsert: false,
+        createdByName: null, mainGroupName: null, productManagerName: null, discontinued: false, createdAt: null, version: "1", depotNo: r.depotNo,
+        unitName1: "Adet", unitName2: "Koli", unitName3: "Palet", unitName4: null,
+        unitCoefficient2: r.product.casePack, unitCoefficient3: r.product.casePack * (PALLET_CASES[r.product.code] ?? 20), unitCoefficient4: null,
+      };
+    });
+    lines.set(`${series}-${number}`, orderLines);
+    const gross = Math.round(rows.reduce((sum, r) => sum + r.quantity * r.unitPrice, 0) * 100) / 100;
+    const netExcl = rows.reduce((sum, r) => sum + r.lineTotal, 0);
+    const netTotal = Math.round(rows.reduce((sum, r) => sum + r.lineTotal * (1 + r.tax / 100), 0) * 100) / 100;
+    const closedLineCount = orderLines.filter((l) => !l.open).length;
+    return {
+      currencyCode, exchangeRate,
+      orderSeries: series, orderNumber: number, orderDate: iso(-orderAgo), deliveryDate,
+      supplierCode: supplier.supplierCode, supplierTitle: supplier.supplierName.toLocaleUpperCase("tr") + " TİC. A.Ş.", salespersonName: salespersons[i % salespersons.length]!,
+      grossTotal: gross, discountTotal: Math.round((gross - netExcl) * 100) / 100, netTotal,
+      projectCode: null, openLineCount: lineCount - closedLineCount, closedLineCount, orderedQuantity, deliveredQuantity,
+      depotNos: [...new Set(rows.map((r) => r.depotNo))],
+      note1: i % 7 === 3 ? "Acil sevk" : i % 7 === 5 ? "Fuar siparişi" : null, note2: null, note9: null, addressNo: 1, addressTitle: null, paymentPlanNo: null, paymentPlanName: null,
+      representativeCode: null, costCenterCode: null, documentNo: null,
+    };
+  });
+  return (purchaseOrderCache = { orders, lines });
+};
+
 /** Tanımsız dönerse gerçek istek atılır; prototipte hiçbir uç gerçek istek atmaz. */
 export const prototypeApi = (path: string, opts: { query?: Record<string, unknown> } = {}): unknown => {
   const query = opts.query ?? {};
@@ -139,11 +213,14 @@ export const prototypeApi = (path: string, opts: { query?: Record<string, unknow
   const customerMatch = route!.match(/^\/api\/erp\/customers\/([^/]+)$/);
   if (customerMatch) {
     const code = decodeURIComponent(customerMatch[1]!);
-    const customer = CUSTOMERS.find((item) => item.code === code);
+    const supplier = Object.values(SUPPLIERS).find((item) => item.supplierCode === code);
+    const customer = CUSTOMERS.find((item) => item.code === code) ?? (supplier
+      ? ({ code, balance: 0, creditLimit: 0, commercialStatus: "B", title: `${supplier.supplierName.toLocaleUpperCase("tr")} TİC. A.Ş. (TEDARİKÇİ)`, province: "İstanbul", district: "Bağcılar" } as unknown as (typeof CUSTOMERS)[number])
+      : undefined);
     if (!customer) return null;
     return {
       customer,
-      addresses: (ADDRESSES[code] ?? []).map((address, index) => ({
+      addresses: (ADDRESSES[code] ?? (supplier ? [{ district: "Bağcılar", province: "İstanbul" }] : [])).map((address, index) => ({
         id: `${code}-a${index + 1}`, customerCode: code, addressNo: index + 1, title: null, cancelled: false, ...address,
       })),
       contacts: [],
@@ -191,6 +268,44 @@ export const prototypeApi = (path: string, opts: { query?: Record<string, unknow
     };
   }
   // ── Satın alma siparişi ──────────────────────────────────────────────────────────────
+  if (route === "/api/erp/exchange-rates") return { USD: 43.25, EUR: 47.1 };
+  if (route === "/api/erp/purchase-orders/close-reasons") {
+    return [{ code: "01", name: "Tedarikçi temin edemiyor" }, { code: "02", name: "Fiyat anlaşmazlığı" }, { code: "03", name: "Mükerrer sipariş" }, { code: "04", name: "Vazgeçildi" }];
+  }
+  if (route === "/api/erp/purchase-orders/lines/close" && (opts as { method?: string }).method === "POST") return true;
+  const stockOrders = route!.match(/^\/api\/erp\/purchase-orders\/stock-orders\/([^/]+)$/);
+  if (stockOrders) {
+    const product = PRODUCTS.find((item) => item.code === decodeURIComponent(stockOrders[1]!));
+    if (!product) return { received: [], given: [] };
+    const today = new Date();
+    const iso = (d: number) => new Date(today.getFullYear(), today.getMonth(), today.getDate() + d).toISOString().slice(0, 10);
+    const customers = ["YILDIZ TOPTAN GIDA KIRTASİYE LTD. ŞTİ.", "MERT MARKET ZİNCİRİ TİC. A.Ş.", "ANADOLU TOPTAN PAZARLAMA A.Ş.", "BEREKET GIDA SAN. LTD. ŞTİ."];
+    const DEPOT_NAMES = ["İkitelli Depo", "Plaza Depo", "Mağaza"];
+    const OWNERS = ["AHMET ERİŞ", "NAMIK ÖZTÜRK", "SELİM AKIN"];
+    const no = Number(product.code.slice(-3));
+    // Alınan: rezerve miktarı 1–3 müşteri siparişine bölünür (toplam = customerOrderQuantity).
+    const reserved = product.customerOrderQuantity ?? 0;
+    const parts = reserved > 0 ? Math.min(3, 1 + (no % 3)) : 0;
+    const received = Array.from({ length: parts }, (_, i) => {
+      const quantity = i === parts - 1 ? reserved - Math.floor(reserved / parts) * (parts - 1) : Math.floor(reserved / parts);
+      return { orderDate: iso(-(2 + i * 4)), documentNo: `SS-${2026000 + no * 3 + i}`, partyTitle: customers[(no + i) % customers.length]!, quantity, deliveredQuantity: 0, deliveryDate: iso(3 + i * 2), depotName: DEPOT_NAMES[(no + i) % 3]!, unitPrice: product.price, discountPercents: [i % 2 === 0 ? 5 : 0, 0, 0, 0], ownerName: OWNERS[(no + i) % 3]! };
+    });
+    // Verilen: açık satın alma siparişleri; bekleyen kısım = incomingOrderQuantity, kalanı teslim alınmış.
+    const waiting = product.incomingOrderQuantity ?? 0;
+    const ordered = product.purchaseOrderedQuantity ?? 0;
+    const supplier = Object.values(SUPPLIERS)[no % Object.values(SUPPLIERS).length]!;
+    const given = ordered > 0 ? [
+      { orderDate: iso(-6), documentNo: `A-${900100 + no}`, partyTitle: supplier.supplierName.toLocaleUpperCase("tr") + " TİC. A.Ş.", quantity: waiting, deliveredQuantity: 0, deliveryDate: iso(8), depotName: DEPOT_NAMES[no % 3]!, unitPrice: Math.round(product.price * 0.62 * 100) / 100, discountPercents: [5, 2, 0, 0], ownerName: OWNERS[no % 3]! },
+      ...(ordered > waiting ? [{ orderDate: iso(-30), documentNo: `A-${900060 + no}`, partyTitle: supplier.supplierName.toLocaleUpperCase("tr") + " TİC. A.Ş.", quantity: ordered - waiting, deliveredQuantity: ordered - waiting, deliveryDate: iso(-12), depotName: DEPOT_NAMES[(no + 1) % 3]!, unitPrice: Math.round(product.price * 0.6 * 100) / 100, discountPercents: [3, 0, 0, 0], ownerName: OWNERS[(no + 1) % 3]! }] : []),
+    ] : [];
+    return { received, given };
+  }
+  const orderDetail = route!.match(/^\/api\/erp\/purchase-orders\/(?!product-defaults|invoice-history|sales-history|stock-orders)([^/]+)\/(\d+)$/);
+  if (orderDetail) {
+    const { orders, lines } = purchaseOrderData();
+    const header = orders.find((o) => o.orderSeries === decodeURIComponent(orderDetail[1]!) && o.orderNumber === Number(orderDetail[2]));
+    return { header: header ?? null, lines: header ? lines.get(`${header.orderSeries}-${header.orderNumber}`) ?? [] : [] };
+  }
   const invoiceHistory = route!.match(/^\/api\/erp\/purchase-orders\/invoice-history\/([^/]+)$/);
   if (invoiceHistory) {
     const product = PRODUCTS.find((item) => item.code === decodeURIComponent(invoiceHistory[1]!));
@@ -255,9 +370,14 @@ export const prototypeApi = (path: string, opts: { query?: Record<string, unknow
       listPrice: product.price,
     };
   }
+  if ((route === "/api/erp/purchase-orders" || route === "/api/erp/purchase-orders/") && !(opts as { method?: string }).method) {
+    const { orders } = purchaseOrderData();
+    const term = String(query.search ?? "");
+    return page(orders.filter((o) => !term || matches(term, `${o.orderSeries}-${o.orderNumber}`, o.supplierTitle, o.supplierCode)), query);
+  }
   if (route === "/api/erp/purchase-orders/" && (opts as { method?: string }).method === "POST") {
-    const body = (opts as { body?: { orderSeries?: string } }).body ?? {};
-    return { orderSeries: body.orderSeries || "A", orderNumber: 900001 };
+    const body = (opts as { body?: { orderSeries?: string; orderNumber?: number | null } }).body ?? {};
+    return { orderSeries: body.orderSeries || "A", orderNumber: (body as { orderNumber?: number | null }).orderNumber ?? 900001 };
   }
   if (route === "/api/erp/sales-orders/" && (opts as { method?: string }).method === "POST") {
     const body = (opts as { body?: { orderType?: number; orderSeries?: string } }).body ?? {};
